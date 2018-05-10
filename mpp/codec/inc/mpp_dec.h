@@ -45,6 +45,7 @@ struct MppDec_t {
     // dec parser thread runtime resource context
     MppPacket           mpp_pkt_in;
     void                *mpp;
+    void                *vproc;
 };
 
 typedef struct {

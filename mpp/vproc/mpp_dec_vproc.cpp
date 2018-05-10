@@ -164,14 +164,9 @@ static void *dec_vproc_thread(void *data)
                     mpp_log_f("IEP_CMD_SET_SRC failed %d\n", ret);
 
                 // setup destination IepImg with new buffer
-                buf = NULL;
-                do {
-                    mpp_buffer_get(group, &buf, size);
-                    if (NULL == buf) {
-                        mpp_log("failed to get buffer\n");
-                        usleep(10000);
-                    }
-                } while (NULL == buf);
+                // NOTE: when deinterlace is enabled parser thread will reserve
+                //       more buffer than normal case
+                mpp_buffer_get(group, &buf, size);
                 mpp_assert(buf);
 
                 fd = mpp_buffer_get_fd(buf);
