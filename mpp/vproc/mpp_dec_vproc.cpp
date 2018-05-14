@@ -14,10 +14,15 @@
  * limitations under the License.
  */
 
+#define MODULE_TAG "mpp_dec_vproc"
+
 #include "mpp_env.h"
 #include "mpp_mem.h"
+#include "mpp_common.h"
 
+#include "mpp_frame_impl.h"
 #include "mpp_dec_vproc.h"
+#include "iep_api.h"
 
 #define vproc_dbg(flag, fmt, ...) \
     do { \
@@ -43,6 +48,8 @@ typedef struct MppDecVprocCtxImpl_t {
     MppThread   *thd;
     RK_U32      reset;
     RK_S32      count;
+
+    IepCtx      iep_ctx;
 } MppDecVprocCtxImpl;
 
 static void mpp_enqueue_frames(Mpp *mpp, MppFrame frame)
@@ -67,21 +74,21 @@ static void *dec_vproc_thread(void *data)
     Mpp *mpp = ctx->mpp;
     MppDec *dec = mpp->mDec;
     MppBufSlots slots = dec->frame_slots;
+    IepImg img;
 
     mpp_dbg(MPP_DBG_INFO, "mpp_dec_post_proc_thread started\n");
 
     while (1) {
         RK_S32 index = -1;
+        MPP_RET ret = MPP_OK;
 
         {
             AutoMutex autolock(thd->mutex());
-            MPP_RET ret = MPP_OK;
 
             if (MPP_THREAD_RUNNING != thd->get_status())
                 break;
 
             if (ctx->reset) {
-                mpp_log_f("reset start\n");
                 // on reset just return all index
                 do {
                     ret = mpp_buf_slot_dequeue(slots, &index, QUEUE_DEINTERLACE);
@@ -91,7 +98,7 @@ static void *dec_vproc_thread(void *data)
                         mpp_log_f("reset index %d\n", index);
                     }
                 } while (ret == MPP_OK);
-                mpp_log_f("reset done\n");
+                mpp_assert(ctx->count == 0);
 
                 thd->lock(THREAD_CONTROL);
                 ctx->reset = 0;
@@ -119,10 +126,81 @@ static void *dec_vproc_thread(void *data)
                 goto VPROC_DONE;
             }
 
-            if (!dec->reset_flag) {
+            if (mpp_frame_get_eos(frame) &&
+                NULL == mpp_frame_get_buffer(frame)) {
                 mpp_enqueue_frames(mpp, frame);
-            } else
-                mpp_frame_deinit(&frame);
+                goto VPROC_DONE;
+            }
+
+            if (!dec->reset_flag && ctx->iep_ctx) {
+                MppBufferGroup group = mpp->mFrameGroup;
+                RK_U32 w = mpp_frame_get_width(frame);
+                RK_U32 h = mpp_frame_get_height(frame);
+                RK_U32 h_str = mpp_frame_get_hor_stride(frame);
+                RK_U32 v_str = mpp_frame_get_ver_stride(frame);
+                MppBuffer buf = mpp_frame_get_buffer(frame);
+                int fd = mpp_buffer_get_fd(buf);
+                size_t size = mpp_buffer_get_size(buf);
+                MppFrame out = NULL;
+                MppFrameImpl *impl = NULL;
+
+                ret = iep_control(ctx->iep_ctx, IEP_CMD_INIT, NULL);
+                if (ret)
+                    mpp_log_f("IEP_CMD_INIT failed %d\n", ret);
+
+                // setup source IepImg
+                memset(&img, 0, sizeof(img));
+                img.act_w = w;
+                img.act_h = h;
+                img.vir_w = h_str;
+                img.vir_h = v_str;
+                img.format = IEP_FORMAT_YCbCr_420_SP;
+                img.mem_addr = fd;
+                img.uv_addr = fd + ((h_str * v_str) << 10);
+                img.v_addr = fd + ((h_str * v_str + h_str * v_str / 4) << 10);
+
+                ret = iep_control(ctx->iep_ctx, IEP_CMD_SET_SRC, &img);
+                if (ret)
+                    mpp_log_f("IEP_CMD_SET_SRC failed %d\n", ret);
+
+                // setup destination IepImg with new buffer
+                buf = NULL;
+                do {
+                    mpp_buffer_get(group, &buf, size);
+                    if (NULL == buf) {
+                        mpp_log("failed to get buffer\n");
+                        usleep(10000);
+                    }
+                } while (NULL == buf);
+                mpp_assert(buf);
+
+                fd = mpp_buffer_get_fd(buf);
+                img.mem_addr = fd;
+                img.uv_addr = fd + ((h_str * v_str) << 10);
+                img.v_addr = fd + ((h_str * v_str + h_str * v_str / 4) << 10);
+
+                ret = iep_control(ctx->iep_ctx, IEP_CMD_SET_DST, &img);
+                if (ret)
+                    mpp_log_f("IEP_CMD_SET_DST failed %d\n", ret);
+
+                // start deinterlace hardware
+                ret = iep_control(ctx->iep_ctx, IEP_CMD_SET_DEI_CFG, NULL);
+                if (ret)
+                    mpp_log_f("IEP_CMD_SET_DEI_CFG failed %d\n", ret);
+
+                ret = iep_control(ctx->iep_ctx, IEP_CMD_RUN_SYNC, NULL);
+                if (ret)
+                    mpp_log_f("IEP_CMD_RUN_SYNC failed %d\n", ret);
+
+                // generate new MppFrame for output
+                mpp_frame_init(&out);
+                mpp_frame_copy(out, frame);
+                impl = (MppFrameImpl *)out;
+                impl->buffer = buf;
+
+                mpp_enqueue_frames(mpp, out);
+            }
+            mpp_frame_deinit(&frame);
 
         VPROC_DONE:
             mpp_buf_slot_clr_flag(slots, index, SLOT_QUEUE_USE);
@@ -135,6 +213,7 @@ static void *dec_vproc_thread(void *data)
 
 MPP_RET dec_vproc_init(MppDecVprocCtx *ctx, void *mpp)
 {
+    MPP_RET ret = MPP_OK;
     if (NULL == ctx || NULL == mpp) {
         mpp_err_f("found NULL input ctx %p mpp %p\n", ctx, mpp);
         return MPP_ERR_NULL_PTR;
@@ -154,11 +233,26 @@ MPP_RET dec_vproc_init(MppDecVprocCtx *ctx, void *mpp)
     p->mpp = (Mpp *)mpp;
     p->slots = p->mpp->mDec->frame_slots;
     p->thd = new MppThread(dec_vproc_thread, p, "mpp_dec_vproc");
+    ret = iep_init(&p->iep_ctx);
+    if (!p->thd || ret) {
+        mpp_err("failed to create context\n");
+        if (p->thd) {
+            delete p->thd;
+            p->thd = NULL;
+        }
+
+        if (p->iep_ctx) {
+            iep_deinit(p->iep_ctx);
+            p->iep_ctx = NULL;
+        }
+
+        MPP_FREE(p);
+    }
 
     *ctx = p;
 
     vproc_func("out");
-    return MPP_OK;
+    return ret;
 }
 
 MPP_RET dec_vproc_deinit(MppDecVprocCtx ctx)
@@ -170,8 +264,16 @@ MPP_RET dec_vproc_deinit(MppDecVprocCtx ctx)
     vproc_func("in");
 
     MppDecVprocCtxImpl *p = (MppDecVprocCtxImpl *)ctx;
-    if (p->thd)
+    if (p->thd) {
         p->thd->stop();
+        delete p->thd;
+        p->thd = NULL;
+    }
+
+    if (p->iep_ctx) {
+        iep_deinit(p->iep_ctx);
+        p->iep_ctx = NULL;
+    }
 
     mpp_free(p);
 
